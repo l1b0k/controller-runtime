@@ -24,7 +24,7 @@ import (
 	"github.com/go-logr/logr"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
-
+	"sigs.k8s.io/controller-runtime/pkg/cluster"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/internal/controller"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
@@ -148,6 +148,65 @@ func NewUnmanaged(name string, mgr manager.Manager, options Options) (Controller
 		MaxConcurrentReconciles: options.MaxConcurrentReconciles,
 		CacheSyncTimeout:        options.CacheSyncTimeout,
 		SetFields:               mgr.SetFields,
+		Name:                    name,
+		LogConstructor:          options.LogConstructor,
+		RecoverPanic:            options.RecoverPanic,
+	}, nil
+}
+
+// NewUnmanagedSlim returns a new controller without adding it to the manager. The
+// caller is responsible for starting the returned controller.
+func NewUnmanagedSlim(name string, l logr.Logger, cluster cluster.Cluster, options Options) (Controller, error) {
+	if options.Reconciler == nil {
+		return nil, fmt.Errorf("must specify Reconciler")
+	}
+
+	if len(name) == 0 {
+		return nil, fmt.Errorf("must specify Name for Controller")
+	}
+
+	if options.LogConstructor == nil {
+		log := l.WithValues(
+			"controller", name,
+		)
+		options.LogConstructor = func(req *reconcile.Request) logr.Logger {
+			log := log
+			if req != nil {
+				log = log.WithValues(
+					"object", klog.KRef(req.Namespace, req.Name),
+					"namespace", req.Namespace, "name", req.Name,
+				)
+			}
+			return log
+		}
+	}
+
+	if options.MaxConcurrentReconciles <= 0 {
+		options.MaxConcurrentReconciles = 1
+	}
+
+	if options.CacheSyncTimeout == 0 {
+		options.CacheSyncTimeout = 2 * time.Minute
+	}
+
+	if options.RateLimiter == nil {
+		options.RateLimiter = workqueue.DefaultControllerRateLimiter()
+	}
+
+	// Inject dependencies into Reconciler
+	if err := cluster.SetFields(options.Reconciler); err != nil {
+		return nil, err
+	}
+
+	// Create controller with dependencies set
+	return &controller.Controller{
+		Do: options.Reconciler,
+		MakeQueue: func() workqueue.RateLimitingInterface {
+			return workqueue.NewNamedRateLimitingQueue(options.RateLimiter, name)
+		},
+		MaxConcurrentReconciles: options.MaxConcurrentReconciles,
+		CacheSyncTimeout:        options.CacheSyncTimeout,
+		SetFields:               cluster.SetFields,
 		Name:                    name,
 		LogConstructor:          options.LogConstructor,
 		RecoverPanic:            options.RecoverPanic,
